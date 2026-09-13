@@ -491,14 +491,34 @@ details.day>summary .pct{font-family:var(--f-disp); font-weight:700; margin-left
 const LKEY = "scoreboard.v2";
 const V1KEY = "set-scoreboard.v1";
 const MEKEY = "scoreboard.me";
+const ROOMKEY = "scoreboard.room";
 const MAX_BACKFILL = 60;
 
+/* ── 공유 저장소(Supabase) 설정 ───────────────────────────────
+   GitHub Pages처럼 일반 웹 주소로 열었을 때 두 사람이 기록을
+   공유하기 위한 저장소. 비워 두면 이 기기 저장으로 동작한다.
+
+   anon 키는 공개되는 것이 전제다. 실제 방어선은 두 겹이다.
+     · entries 테이블은 RLS로 직접 접근이 전면 차단돼 있고,
+       security definer 함수 세 개만이 통로다.
+     · 그 함수들은 방 코드(128비트 난수)를 인자로 요구한다.
+       방 코드는 저장소에 넣지 않고 초대 링크(#r=…)로만 오간다.
+   준비: supabase-setup.sql 을 Supabase SQL Editor에 붙여넣고 실행. */
+const SUPABASE_URL = "";        // 예: https://xxxxxxxxxxxx.supabase.co
+const SUPABASE_ANON_KEY = "";   // Project Settings → API → anon public
+
 const Store = {
-  mode: "memory",      // "cloud" | "local" | "memory"
+  mode: "memory",      // "cloud" | "supa" | "local" | "memory"
   db: null,
-  docs: new Map(),     // local/memory 캐시 (cloud에서도 읽기 캐시로 씀)
+  room: null,
+  docs: new Map(),     // 모든 모드의 읽기 캐시
+  lastWriteAt: 0,
+
+  /** 여러 기기·두 사람이 같은 기록을 보는 모드인가 */
+  get shared(){ return this.mode === "cloud" || this.mode === "supa"; },
 
   async init(){
+    // 1) Claude 아티팩트 뷰어 안이면 전용 서버 저장소를 쓴다
     try{
       if(window.claude && typeof window.claude.use === "function"){
         this.db = await Promise.race([
@@ -508,6 +528,21 @@ const Store = {
       }
     }catch(e){ this.db = null; }
     if(this.db){ this.mode = "cloud"; return; }
+
+    // 2) 일반 웹 주소 + Supabase 설정이 있으면 공유 저장소
+    if(SUPABASE_URL && SUPABASE_ANON_KEY){
+      this.room = readRoom() || newRoom();
+      rememberRoom(this.room);
+      try{
+        await this.supaLoad();
+        this.mode = "supa";
+        return;
+      }catch(e){
+        warnOnce("공유 저장소에 연결하지 못해 이 기기 저장으로 전환했습니다.");
+      }
+    }
+
+    // 3) 이 기기에만
     try{
       localStorage.setItem("__probe","1"); localStorage.removeItem("__probe");
       this.mode = "local";
@@ -515,6 +550,42 @@ const Store = {
       if(raw) for(const [k,v] of Object.entries(JSON.parse(raw).docs || {})) this.docs.set(k,v);
     }catch(e){ this.mode = "memory"; }
   },
+
+  /* ── Supabase: SDK 없이 PostgREST의 RPC만 호출한다 ── */
+  async supaRpc(fn, body){
+    const res = await fetch(SUPABASE_URL + "/rest/v1/rpc/" + fn, {
+      method: "POST",
+      headers: {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": "Bearer " + SUPABASE_ANON_KEY,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(body)
+    });
+    if(!res.ok){
+      const t = await res.text().catch(()=>"");
+      const err = new Error("Supabase " + res.status + " " + t.slice(0,160));
+      err.status = res.status;
+      throw err;
+    }
+    const txt = await res.text();
+    return txt ? JSON.parse(txt) : null;
+  },
+  async supaLoad(){
+    const rows = (await this.supaRpc("sb_list", { p_room: this.room })) || [];
+    const seen = new Set();
+    for(const r of rows){ this.docs.set(r.path, r.data); seen.add(r.path); }
+    for(const k of [...this.docs.keys()]) if(!seen.has(k)) this.docs.delete(k);
+    return rows.length;
+  },
+  /** 상대방의 변경을 끌어온다. 내가 막 쓴 직후에는 건너뛴다 */
+  async refresh(){
+    if(this.mode !== "supa") return false;
+    if(pending.size || Date.now()-this.lastWriteAt < 3000) return false;
+    try{ await this.supaLoad(); return true; }
+    catch(e){ return false; }
+  },
+
   persistLocal(){
     if(this.mode !== "local") return;
     try{ localStorage.setItem(LKEY, JSON.stringify({docs:Object.fromEntries(this.docs)})); }
@@ -531,13 +602,23 @@ const Store = {
   },
   async set(path, doc){
     this.docs.set(path, doc);
-    if(this.mode === "cloud") await this.db.doc(path).set(doc);
-    else this.persistLocal();
+    this.lastWriteAt = Date.now();
+    if(this.mode === "cloud"){ await this.db.doc(path).set(doc); return; }
+    if(this.mode === "supa"){
+      await this.supaRpc("sb_put", { p_room:this.room, p_path:path, p_data:doc });
+      return;
+    }
+    this.persistLocal();
   },
   async del(path){
     this.docs.delete(path);
-    if(this.mode === "cloud") await this.db.doc(path).delete();
-    else this.persistLocal();
+    this.lastWriteAt = Date.now();
+    if(this.mode === "cloud"){ await this.db.doc(path).delete(); return; }
+    if(this.mode === "supa"){
+      await this.supaRpc("sb_del", { p_room:this.room, p_path:path });
+      return;
+    }
+    this.persistLocal();
   },
   /** 컬렉션 전체를 한 번 읽어 캐시에 채운다 */
   async loadAll(coll){
@@ -582,9 +663,10 @@ async function flushWrites(){
     catch(e){
       if(!writeErr){
         writeErr = true;
-        const c = e && e.code;
+        const c = e && e.code, st = e && e.status;
         toast(c === "quota_exceeded" ? "저장 공간이 가득 찼습니다. 오래된 기록을 지워 주세요."
             : c === "revoked" ? "저장 권한이 해제되었습니다. 새로 고쳐 주세요."
+            : (st === 401 || st === 403) ? "공유 저장소가 접근을 거부했습니다. 초대 링크가 올바른지 확인해 주세요."
             : "저장에 실패했습니다. 연결을 확인해 주세요.", 6000);
       }
     }
@@ -800,14 +882,52 @@ const askPick = (title, items, note) => modal({
       선택은 URL 해시(#p=…)와 이 기기에 함께 남겨서
       홈 화면 바로가기마다 다른 사람으로 열 수 있다.
    ════════════════════════════════════════════════════════════ */
+/* 주소 해시에 p(나)와 r(방 코드)을 함께 싣는다. 둘을 서로
+   지우지 않도록 항상 병합해서 쓴다. */
+function hashParams(){
+  const out = {};
+  for(const part of location.hash.replace(/^#/,"").split("&")){
+    const i = part.indexOf("=");
+    if(i > 0) out[part.slice(0,i)] = part.slice(i+1);
+  }
+  return out;
+}
+function writeHash(patch){
+  const h = Object.assign(hashParams(), patch);
+  const s = Object.entries(h).filter(([,v])=>v).map(([k,v])=>k+"="+v).join("&");
+  try{ history.replaceState(null,"", location.pathname + location.search + (s ? "#"+s : "")); }
+  catch(e){}
+}
 function readSavedMe(){
-  const m = location.hash.match(/p=([A-Za-z0-9_-]+)/);
-  if(m) return m[1];
+  const h = hashParams();
+  if(h.p) return h.p;
   try{ return localStorage.getItem(MEKEY); }catch(e){ return null; }
 }
 function rememberMe(pid){
   try{ localStorage.setItem(MEKEY,pid); }catch(e){}
-  try{ history.replaceState(null,"","#p="+pid); }catch(e){}
+  writeHash({ p: pid });
+}
+/* 방 코드 — 이 값을 아는 사람만 기록을 읽고 쓸 수 있다.
+   저장소(코드)에는 절대 넣지 않고 초대 링크로만 전달한다. */
+function newRoom(){
+  const a = new Uint8Array(16);
+  crypto.getRandomValues(a);
+  return [...a].map(b=>b.toString(16).padStart(2,"0")).join("");
+}
+function readRoom(){
+  const h = hashParams();
+  if(h.r && /^[a-f0-9]{32}$/.test(h.r)) return h.r;
+  try{
+    const v = localStorage.getItem(ROOMKEY);
+    return (v && /^[a-f0-9]{32}$/.test(v)) ? v : null;
+  }catch(e){ return null; }
+}
+function rememberRoom(room){
+  try{ localStorage.setItem(ROOMKEY, room); }catch(e){}
+  writeHash({ r: room });
+}
+function inviteLink(){
+  return location.origin + location.pathname + "#r=" + (Store.room || "");
 }
 async function createProfile(name){
   const pid = "p" + Date.now().toString(36);
@@ -833,6 +953,24 @@ async function gate(){
       b.append(el("p","sub", PROFILES.length
         ? "고른 사람으로 기록됩니다. 이 기기는 다음부터 기억합니다."
         : "먼저 프로필을 만들어 주세요. 두 사람이 각자 목표와 기록을 따로 갖습니다."));
+      // 빈 방으로 들어온 경우, 초대 링크를 안 쓴 것일 수 있다
+      if(!PROFILES.length && Store.mode === "supa"){
+        const hint = el("div","note");
+        hint.innerHTML = "이미 쓰던 기록이 있다면 이 화면이 아니라 <b>초대 링크</b>로 열어야 합니다. "
+          + "지금 새 방이 만들어진 상태라, 그냥 진행하면 빈 기록으로 시작합니다.";
+        b.append(hint);
+        const join = el("button","btn sm ghost wide","초대 링크 / 방 코드 입력");
+        join.type = "button";
+        join.onclick = async ()=>{
+          const v = await askText("방 코드 입력","초대 링크를 그대로 붙여넣어도 됩니다","");
+          if(!v) return;
+          const code = (v.match(/[a-f0-9]{32}/) || [])[0];
+          if(!code){ toast("32자리 방 코드를 찾지 못했습니다."); return; }
+          rememberRoom(code);
+          location.reload();
+        };
+        b.append(join);
+      }
       for(const it of items){
         const btn = el("button","pickbtn");
         btn.type = "button";
@@ -1423,9 +1561,9 @@ function renderSetup(){
     ph.append(row);
   }
   if(PROFILES.length < 2){
-    ph.append(el("div","note", Store.mode === "cloud"
-      ? "여자친구분은 <b>같은 링크</b>를 열고 '사람 추가'로 자기 프로필을 만들면 됩니다. 서로의 진행이 오늘 화면에 함께 표시됩니다."
-      : "지금은 이 기기에만 저장되는 상태라 두 사람이 함께 쓸 수 없습니다. 발행된 링크로 접속해 주세요."));
+    ph.append(el("div","note", Store.shared
+      ? "같이 운동하는 사람은 <b>초대 링크</b>(저장 위치 카드에 있습니다)를 열고 '사람 추가'로 자기 프로필을 만들면 됩니다. 서로의 진행이 오늘 화면에 함께 표시됩니다."
+      : "지금은 이 기기에만 저장되는 상태라 두 사람이 함께 쓸 수 없습니다. 공유 저장소가 연결된 주소로 접속해 주세요."));
   }
 
   $("#set-remind-time").value = `${pad(cfg.remindH)}:${pad(cfg.remindM)}`;
@@ -1441,18 +1579,51 @@ function renderSetup(){
 function renderStorageInfo(){
   const host = $("#storage-info"); host.textContent = "";
   const where = el("div","where");
-  if(Store.mode === "cloud"){
-    where.innerHTML = `<span class="badge">서버 저장</span><span>기록이 서버에 남아 폰·PC 어디서 열어도 이어집니다. 두 사람이 서로의 진행을 봅니다.</span>`;
+  if(Store.mode === "supa"){
+    where.innerHTML = `<span class="badge">공유 저장</span><span>기록이 공유 서버에 남습니다. 초대 링크를 연 사람끼리 같은 기록을 보고, 폰·PC 어디서 열어도 이어집니다.</span>`;
+  }else if(Store.mode === "cloud"){
+    where.innerHTML = `<span class="badge">서버 저장</span><span>아티팩트 전용 서버에 남습니다. 같은 아티팩트를 연 사람끼리 공유되며, 이 기록은 웹 주소 쪽과는 별개입니다.</span>`;
   }else if(Store.mode === "local"){
-    where.innerHTML = `<span class="badge local">이 기기에만</span><span>서버에 연결하지 못했습니다. 이 브라우저 안에만 저장되며 다른 기기와 공유되지 않습니다.</span>`;
+    where.innerHTML = `<span class="badge local">이 기기에만</span><span>공유 서버에 연결하지 못했습니다. 이 브라우저 안에만 저장되며 다른 기기와 공유되지 않습니다.</span>`;
   }else{
     where.innerHTML = `<span class="badge none">저장 안 됨</span><span>브라우저가 저장을 막고 있습니다. 새로 고치면 기록이 사라집니다.</span>`;
   }
   host.append(where);
+
+  if(Store.mode === "supa"){
+    const box = el("div"); box.style.cssText = "display:flex;flex-direction:column;gap:8px";
+    box.append(el("div","lbl","초대 링크"));
+    box.append(el("div","sub","이 링크를 연 사람은 같은 기록을 함께 씁니다. 같이 운동하는 사람에게만 보내세요."));
+    const inp = el("input"); inp.type = "text"; inp.readOnly = true; inp.value = inviteLink();
+    inp.onfocus = ()=> inp.select();
+    box.append(inp);
+    const row = el("div","row");
+    const cp = el("button","btn sm primary","링크 복사"); cp.type = "button";
+    cp.onclick = async ()=>{
+      try{ await navigator.clipboard.writeText(inviteLink()); toast("초대 링크를 복사했습니다."); }
+      catch(e){ inp.select(); toast("자동 복사가 막혔습니다. 선택된 주소를 직접 복사하세요."); }
+    };
+    row.append(cp);
+    const join = el("button","btn sm ghost","다른 방으로 이동"); join.type = "button";
+    join.onclick = async ()=>{
+      const v = await askText("방 코드 입력","상대방 초대 링크의 #r= 뒤 32자리", "");
+      if(!v) return;
+      const code = (v.match(/[a-f0-9]{32}/) || [])[0];
+      if(!code){ toast("32자리 방 코드를 찾지 못했습니다."); return; }
+      if(!await ask("방 이동","이 기기를 그 방의 기록으로 바꿉니다. 지금 방의 기록은 서버에 그대로 남습니다.","이동")) return;
+      rememberRoom(code);
+      location.reload();
+    };
+    row.append(join);
+    box.append(row);
+    host.append(box);
+    return;
+  }
+
   if(Store.mode !== "cloud"){
     host.append(el("div","note warn", Store.mode === "memory"
-      ? "시크릿 모드이거나 브라우저가 저장을 차단한 상태입니다. 일반 창에서 열거나, 발행된 링크로 접속해 주세요."
-      : "발행된 아티팩트 링크로 열면 서버 저장이 켜집니다. 지금 기록은 JSON 백업으로 옮길 수 있습니다."));
+      ? "시크릿 모드이거나 브라우저가 저장을 차단한 상태입니다. 일반 창에서 열어 주세요."
+      : "공유 저장소가 설정되지 않았거나 연결에 실패했습니다. 지금 기록은 JSON 백업으로 옮길 수 있습니다."));
   }
 }
 function fieldText(label, val, onchange){
@@ -1770,6 +1941,15 @@ async function boot(){
     stopDays = Store.watch("days", {field:"date", op:"==", value:todayKey()}, ()=>{ renderAll(); });
   };
   watchToday();
+
+  // Supabase 모드에는 실시간 푸시가 없으므로 주기적으로 끌어온다.
+  // 화면이 보일 때만 돌리고, 앱으로 돌아오는 순간에도 한 번 당긴다.
+  if(Store.mode === "supa"){
+    const pull = async ()=>{ if(await Store.refresh()) renderAll(); };
+    setInterval(()=>{ if(!document.hidden) pull(); }, 20000);
+    addEventListener("focus", pull);
+    document.addEventListener("visibilitychange", ()=>{ if(!document.hidden) pull(); });
+  }
 
   let lastTick = todayKey();
   setInterval(()=>{

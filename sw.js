@@ -1,6 +1,6 @@
 /* 자동 생성 — build.js가 workout.html 해시로 버전을 찍는다 */
 "use strict";
-const CACHE = "scoreboard-204d30c97b";
+const CACHE = "scoreboard-b500ded0ef";
 const SHELL = [
   "./", "./index.html", "./manifest.webmanifest",
   "./icons/icon-192.png", "./icons/icon-512.png", "./icons/apple-touch-icon.png"
