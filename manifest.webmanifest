@@ -1,0 +1,30 @@
+{
+  "name": "세트 스코어보드",
+  "short_name": "스코어보드",
+  "description": "세트마다 체크하는 운동 기록. 남은 세트, 연속 완주, 월별 밀도를 한 화면에서 봅니다.",
+  "lang": "ko",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#EDEFF2",
+  "theme_color": "#C85B08",
+  "icons": [
+    {
+      "src": "./icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "./icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    },
+    {
+      "src": "./icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}

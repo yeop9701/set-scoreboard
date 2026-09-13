@@ -1,0 +1,9 @@
+# 작업 중 생성한 임시 검증 스크립트
+_*.js
+
+node_modules/
+
+# OS
+Thumbs.db
+desktop.ini
+.DS_Store
